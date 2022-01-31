@@ -1,0 +1,198 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jan 14 14:22:25 2021
+
+@author: cbwong
+"""
+"""Script to run a random forest algorithm over a raster containing a composite
+of explanatory variable bands at 10m resolution. Change the bandsLocation,
+trainingPoints, trainingBand, and outputLocation strings accordingly. Line
+apprx. 106 should also be changed/checked prior to running."""
+
+import os
+from osgeo import gdal, gdal_array
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import datetime
+
+# Tell GDAL to throw Python exceptions and register all drivers
+gdal.UseExceptions()
+gdal.AllRegister()
+
+a = datetime.datetime.now()
+
+bandsLocation = 'D:\Projects\DepressionStorageRemoteSensing\\UpperMustinka\Composite2019Clip'
+trainingPoints = 'D:\Projects\DepressionStorageRemoteSensing\\UpperMustinka\TrainingData\August082018TrainingPoints3.tif'
+trainingBand = 'D:\Projects\DepressionStorageRemoteSensing\\UpperMustinka\TrainingData\August082018TrainingBands.tif'
+outputLocation = 'D:\Projects\DepressionStorageRemoteSensing\\UpperMustinka\Classified2019'
+probabilityWaterLoc = 'D:\Projects\DepressionStorageRemoteSensing\\UpperMustinka\ProbabilityWater'
+probabilityLandLoc = 'D:\Projects\DepressionStorageRemoteSensing\\UpperMustinka\ProbabilityLand'
+
+print('training')
+print('training data is ' + str(trainingBand))
+training_band = gdal.Open(trainingBand, gdal.GA_ReadOnly)
+training_points = gdal.Open(trainingPoints, gdal.GA_ReadOnly)
+
+img = np.zeros((training_band.RasterYSize, training_band.RasterXSize, training_band.RasterCount),
+                gdal_array.GDALTypeCodeToNumericTypeCode(training_band.GetRasterBand(1).DataType))
+for b in range(img.shape[2]):
+    img[:, :, b] = training_band.GetRasterBand(b+1).ReadAsArray()
+
+roi = training_points.GetRasterBand(1).ReadAsArray().astype(np.uint8)
+
+# Determine number of training sample pixels
+n_samples = (roi > 0).sum()
+print('We have {n} samples'.format(n=n_samples))
+
+# Determine the classes in our training data
+labels = np.unique(roi[roi>0])
+print('The training data includes {n} classes: {classes}'.format(n=labels.size,
+                                                                  classes=labels))
+
+# Make an "X" matrix containing our bands, and a "y" array containing our training data 
+X=img[roi > 0, :]
+X = np.nan_to_num(X)
+y = roi[roi > 0]
+
+# The shapes of the rasters need to be the same: Same pixel size AND extent
+print('Our X matrix is sized: {sz}'.format(sz=X.shape))
+print('Our y array is sized: {sz}'.format(sz=y.shape))
+
+# Split into training and validation data
+SPLIT_RND_SEED = 12345
+X_train, X_test, y_train, y_test = train_test_split(X, y, 
+                                                    test_size=0.3, 
+                                                    random_state=SPLIT_RND_SEED)  # 70% training and 30% test
+
+# Initialize the random forest with "n" number of trees
+# best_params = {'max_depth': 11, 'max_features': 2, 'min_samples_leaf': 1, 'n_estimators': 53}
+rf = RandomForestClassifier(
+                            oob_score=True, 
+                            random_state=12345, 
+                            verbose=False)
+
+# Fit the random forest to training data
+rf = rf.fit(X_train, y_train)
+
+# Print statistics of "out-of-bag" prediction accuracy
+print('Our OOB prediciton of accuracy is:{oob}%'.format(oob=rf.oob_score_ * 100))
+
+# Get statistics of importance of each band in making decisions
+bands = ['VH', 'VV', 'IA', 'NDVI', 'Rainfall']
+
+for b, imp in zip(bands, rf.feature_importances_):
+    print('Band {b} importance: {imp}'.format(b=b, imp=imp))
+
+print("Starting batch random forest")
+tifList = []
+for root, dirs, files in os.walk(bandsLocation):
+    for name in files:
+        if name.endswith(".tif"):
+            tifList.append(os.path.join(root, name))
+
+print ("output will look like: " + 'classified' + tifList[-1][-25:-17] +'.tif')
+
+for items in tifList:
+    print('processing ' + items)
+    #-----------------------Predict a new area-----------------------------
+    
+    # Read the new area of interest and reshape it into a 2d array
+    input_bands = gdal.Open(items, gdal.GA_ReadOnly)
+    pred_img = np.zeros((input_bands.RasterYSize, input_bands.RasterXSize, input_bands.RasterCount),
+                    gdal_array.GDALTypeCodeToNumericTypeCode(input_bands.GetRasterBand(1).DataType))
+    for b in range(pred_img.shape[2]):
+        pred_img[:, :, b] = input_bands.GetRasterBand(b+1).ReadAsArray()
+    new_shape = (pred_img.shape[0] * pred_img.shape[1], pred_img.shape[2])
+    
+    img_as_array = pred_img[:, :, :3].reshape(new_shape) #Change third index to number of bands used
+    print('Reshaped from {o} to {n}'.format(o=pred_img.shape,
+                                            n=img_as_array.shape))
+    img_as_array = np.nan_to_num(img_as_array)
+    
+    # Now predict each pixel using the trained random forest
+    class_prediction = rf.predict(img_as_array)
+    
+    # Reshape the classified array
+    class_prediction = class_prediction.reshape(pred_img[:, :, 0].shape)
+    
+    #Make a probability prediction array
+    # Contains 3 columns, prob of land(col1), prob of water(col2)
+    #prob of nodata(col3)
+    probabilities = rf.predict_proba(img_as_array)
+    
+    # Isolate probability of water (column 2)
+    prob2 = probabilities[:,1]
+    
+    #Reshape probability array
+    prob2 = prob2.reshape(pred_img[:, :, 0].shape)
+    
+    # Isolate probability of land (column 1)
+    prob3 = probabilities[:,0]
+    
+    #Reshape probability array
+    prob3 = prob3.reshape(pred_img[:,:,0].shape)
+    
+#------------------------Save Classifier Result-------------------------------
+
+    # Write to disk. Make sure dst_filename is unique or you'll get runtime error
+    rasterName = 'classified' + items[-25:-17] +'.tif'
+    dst_filename = os.path.join(outputLocation, rasterName)
+    x_pixels = len(class_prediction[0])
+    y_pixels = len(class_prediction)
+    driver = gdal.GetDriverByName('GTiff')
+    dataset = driver.Create(dst_filename, x_pixels, y_pixels, 1, gdal.GDT_Float32)
+    dataset.GetRasterBand(1).WriteArray(class_prediction)
+    
+    # Apply projection and geotransform (defining pixel size and upper left corner)
+    geotrans = input_bands.GetGeoTransform()
+    proj = input_bands.GetProjection()
+    dataset.SetGeoTransform(geotrans)
+    dataset.SetProjection(proj)
+    dataset.FlushCache()
+    dataset = None # Close the dataset
+    # b = datetime.datetime.now()
+    # c = b-a
+    # print(str(c.total_seconds()/60/60) + " hours to run")
+    
+# #------------------------Save Probability water Result------------------------
+#     # Write to disk. Make sure dst_filename is unique or you'll get runtime error
+#     rasterName = 'probs' + items[-25:-17] +'.tif'
+#     prb_filename = os.path.join(probabilityWaterLoc, rasterName)
+#     x_pixels = len(prob2[0])
+#     y_pixels = len(prob2)
+#     driver = gdal.GetDriverByName('GTiff')
+#     dataset = driver.Create(prb_filename, x_pixels, y_pixels, 1, gdal.GDT_Float32)
+#     dataset.GetRasterBand(1).WriteArray(prob2)
+    
+#     # Apply projection and geotransform (defining pixel size and upper left corner)
+#     geotrans = input_bands.GetGeoTransform()
+#     proj = input_bands.GetProjection()
+#     dataset.SetGeoTransform(geotrans)
+#     dataset.SetProjection(proj)
+#     dataset.FlushCache()
+#     dataset = None # Close the dataset
+#     b = datetime.datetime.now()
+#     c = b-a
+#     print(str(c.total_seconds()/60/60) + " hours to run")
+    
+#  #------------------------Save Probability land Result------------------------
+#     # Write to disk. Make sure dst_filename is unique or you'll get runtime error
+#     rasterName = 'probs' + items[-25:-17] +'.tif'
+#     prb_filename = os.path.join(probabilityLandLoc, rasterName)
+#     x_pixels = len(prob3[0])
+#     y_pixels = len(prob3)
+#     driver = gdal.GetDriverByName('GTiff')
+#     dataset = driver.Create(prb_filename, x_pixels, y_pixels, 1, gdal.GDT_Float32)
+#     dataset.GetRasterBand(1).WriteArray(prob3)
+    
+#     # Apply projection and geotransform (defining pixel size and upper left corner)
+#     geotrans = input_bands.GetGeoTransform()
+#     proj = input_bands.GetProjection()
+#     dataset.SetGeoTransform(geotrans)
+#     dataset.SetProjection(proj)
+#     dataset.FlushCache()
+#     dataset = None # Close the dataset
+#     b = datetime.datetime.now()
+#     c = b-a
+#     print(str(c.total_seconds()/60/60) + " hours to run")
